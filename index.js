@@ -1,7 +1,18 @@
+// @ts-check
+/* eslint-disable */
+/// <reference path="./index.d.ts" />
+/* eslint-enable */
 'use strict';
 
 // use Polyfill for util.promisify in node versions < v8
 const promisify = require('util.promisify');
+
+// Import webpack types using commonjs
+// As we use only the type we have to prevent warnings about unused varaibles
+/* eslint-disable */
+const WebpackCompiler = require('webpack/lib/Compiler');
+const WebpackCompilation = require('webpack/lib/Compilation');
+/* eslint-enable */
 
 const vm = require('vm');
 const fs = require('fs');
@@ -20,10 +31,17 @@ const fsStatAsync = promisify(fs.stat);
 const fsReadFileAsync = promisify(fs.readFile);
 
 class HtmlWebpackPlugin {
+  /**
+   * @param {Partial<HtmlWebpackPluginOptions>} options
+   */
   constructor (options) {
     // Default options
+    /**
+     * @type {HtmlWebpackPluginOptions}
+     */
     this.options = _.extend({
       template: path.join(__dirname, 'default_index.ejs'),
+      templateContent: undefined,
       templateParameters: templateParametersGenerator,
       filename: 'index.html',
       hash: false,
@@ -40,8 +58,18 @@ class HtmlWebpackPlugin {
       title: 'Webpack App',
       xhtml: false
     }, options);
+    // Instance variables to keep caching information
+    // for multiple builds
+    this.childCompilerHash = undefined;
+    this.childCompilationOutputName = undefined;
+    this.assetJson = undefined;
+    this.hash = undefined;
   }
 
+  /**
+   * apply is called by the webpack main compiler during the start phase
+   * @param {WebpackCompiler} compiler
+   */
   apply (compiler) {
     const self = this;
     let isCompilationCached = false;
@@ -56,8 +84,12 @@ class HtmlWebpackPlugin {
       this.options.filename = path.relative(compiler.options.output.path, filename);
     }
 
-    // setup hooks for webpack 4
+    // setup hooks for third party plugins
     compiler.hooks.compilation.tap('HtmlWebpackPluginHooks', compilation => {
+      // Setup the hooks only once
+      if (compilation.hooks.htmlWebpackPluginAlterChunks) {
+        return;
+      }
       compilation.hooks.htmlWebpackPluginAlterChunks = new SyncWaterfallHook(['chunks', 'objectWithPluginRef']);
       compilation.hooks.htmlWebpackPluginBeforeHtmlGeneration = new AsyncSeriesWaterfallHook(['pluginArgs']);
       compilation.hooks.htmlWebpackPluginBeforeHtmlProcessing = new AsyncSeriesWaterfallHook(['pluginArgs']);
@@ -86,7 +118,13 @@ class HtmlWebpackPlugin {
         });
     });
 
-    compiler.hooks.emit.tapAsync('HtmlWebpackPlugin', (compilation, callback) => {
+    compiler.hooks.emit.tapAsync('HtmlWebpackPlugin',
+    /**
+     * Hook into the webpack emit phase
+     * @param {WebpackCompilation} compilation
+     * @param {() => void} callback
+    */
+    (compilation, callback) => {
       const applyPluginsAsyncWaterfall = self.applyPluginsAsyncWaterfall(compilation);
       // Get chunks info as json
       // Note: we're excluding stuff that we don't need to improve toJson serialization speed.
@@ -175,7 +213,7 @@ class HtmlWebpackPlugin {
           const html = result.html;
           const assets = result.assets;
           // Prepare script and link tags
-          const assetTags = self.generateHtmlTags(assets);
+          const assetTags = self.generateHtmlTagObjects(assets);
           const pluginArgs = {head: assetTags.head, body: assetTags.body, plugin: self, chunks: chunks, outputName: self.childCompilationOutputName};
           // Allow plugins to change the assetTag definitions
           return applyPluginsAsyncWaterfall('htmlWebpackPluginAlterAssetTags', true, pluginArgs)
@@ -252,6 +290,8 @@ class HtmlWebpackPlugin {
 
   /**
    * Generate the template parameters for the template function
+   * @param {WebpackCompilation} compilation
+   *
    */
   getTemplateParameters (compilation, assets) {
     if (typeof this.options.templateParameters === 'function') {
@@ -266,22 +306,21 @@ class HtmlWebpackPlugin {
   /**
    * Html post processing
    *
-   * Returns a promise
+   * @returns Promise<string>
    */
   executeTemplate (templateFunction, chunks, assets, compilation) {
-    return Promise.resolve()
-      // Template processing
-      .then(() => {
-        const templateParams = this.getTemplateParameters(compilation, assets);
-        let html = '';
-        try {
-          html = templateFunction(templateParams);
-        } catch (e) {
-          compilation.errors.push(new Error('Template execution failed: ' + e));
-          return Promise.reject(e);
-        }
-        return html;
-      });
+    // Template processing
+    const templateParams = this.getTemplateParameters(compilation, assets);
+    let html = '';
+    try {
+      html = templateFunction(templateParams);
+    } catch (e) {
+      compilation.errors.push(new Error('Template execution failed: ' + e));
+      return Promise.reject(e);
+    }
+    // If html is a promise return the promise
+    // If html is a string turn it into a promise
+    return Promise.resolve().then(() => html);
   }
 
   /**
@@ -290,24 +329,23 @@ class HtmlWebpackPlugin {
    * Returns a promise
    */
   postProcessHtml (html, assets, assetTags) {
-    const self = this;
     if (typeof html !== 'string') {
       return Promise.reject('Expected html to be a string but got ' + JSON.stringify(html));
     }
     return Promise.resolve()
       // Inject
       .then(() => {
-        if (self.options.inject) {
-          return self.injectAssetsIntoHtml(html, assets, assetTags);
+        if (this.options.inject) {
+          return this.injectAssetsIntoHtml(html, assets, assetTags);
         } else {
           return html;
         }
       })
       // Minify
       .then(html => {
-        if (self.options.minify) {
+        if (this.options.minify) {
           const minify = require('html-minifier').minify;
-          return minify(html, self.options.minify);
+          return minify(html, this.options.minify === true ? {} : this.options.minify);
         }
         return html;
       });
@@ -315,6 +353,8 @@ class HtmlWebpackPlugin {
 
   /*
    * Pushes the content of the given filename to the compilation assets
+   * @param {string} filename
+   * @param {WebpackCompilation} compilation
    */
   addFileToAssets (filename, compilation) {
     filename = path.resolve(compilation.compiler.context, filename);
@@ -331,12 +371,7 @@ class HtmlWebpackPlugin {
     .catch(() => Promise.reject(new Error('HtmlWebpackPlugin: could not load file ' + filename)))
     .then(results => {
       const basename = path.basename(filename);
-      if (compilation.fileDependencies.add) {
-        compilation.fileDependencies.add(filename);
-      } else {
-        // Before Webpack 4 - fileDepenencies was an array
-        compilation.fileDependencies.push(filename);
-      }
+      compilation.fileDependencies.add(filename);
       compilation.assets[basename] = {
         source: () => results.source,
         size: () => results.size.size
@@ -362,6 +397,9 @@ class HtmlWebpackPlugin {
 
   /**
    * Return all chunks from the compilation result which match the exclude and include filters
+   * @param {string[]} chunks
+   * @param {string[]|'all'} includedChunks
+   * @param {string[]} excludedChunks
    */
   filterChunks (chunks, includedChunks, excludedChunks) {
     return chunks.filter(chunk => {
@@ -396,7 +434,6 @@ class HtmlWebpackPlugin {
   }
 
   htmlWebpackPluginAssets (compilation, chunks) {
-    const self = this;
     const compilationHash = compilation.hash;
 
     // Use the configured public path or build a relative path
@@ -404,7 +441,7 @@ class HtmlWebpackPlugin {
       // If a hard coded public path exists use it
       ? compilation.mainTemplate.getPublicPath({hash: compilationHash})
       // If no public path was set get a relative url path
-      : path.relative(path.resolve(compilation.options.output.path, path.dirname(self.childCompilationOutputName)), compilation.options.output.path)
+      : path.relative(path.resolve(compilation.options.output.path, path.dirname(this.childCompilationOutputName)), compilation.options.output.path)
         .split(path.sep).join('/');
 
     if (publicPath.length && publicPath.substr(-1, 1) !== '/') {
@@ -426,8 +463,8 @@ class HtmlWebpackPlugin {
 
     // Append a hash for cache busting
     if (this.options.hash) {
-      assets.manifest = self.appendHash(assets.manifest, compilationHash);
-      assets.favicon = self.appendHash(assets.favicon, compilationHash);
+      assets.manifest = this.appendHash(assets.manifest, compilationHash);
+      assets.favicon = this.appendHash(assets.favicon, compilationHash);
     }
 
     for (let i = 0; i < chunks.length; i++) {
@@ -441,7 +478,7 @@ class HtmlWebpackPlugin {
 
       // Append a hash for cache busting
       if (this.options.hash) {
-        chunkFiles = chunkFiles.map(chunkFile => self.appendHash(chunkFile, compilationHash));
+        chunkFiles = chunkFiles.map(chunkFile => this.appendHash(chunkFile, compilationHash));
       }
 
       // Webpack outputs an array for each chunk when using sourcemaps
@@ -469,21 +506,22 @@ class HtmlWebpackPlugin {
 
   /**
    * Generate meta tags
+   * @returns {HtmlTagObject[]}
    */
   getMetaTags () {
-    if (this.options.meta === false) {
+    const metaOptions = this.options.meta;
+    if (metaOptions === false) {
       return [];
     }
     // Make tags self-closing in case of xhtml
     // Turn { "viewport" : "width=500, initial-scale=1" } into
     // [{ name:"viewport" content:"width=500, initial-scale=1" }]
-    const selfClosingTag = !!this.options.xhtml;
-    const metaTagAttributeObjects = Object.keys(this.options.meta).map((metaName) => {
-      const metaTagContent = this.options.meta[metaName];
-      return (typeof metaTagContent === 'object') ? metaTagContent : {
+    const metaTagAttributeObjects = Object.keys(metaOptions).map((metaName) => {
+      const metaTagContent = metaOptions[metaName];
+      return (typeof metaTagContent === 'string') ? {
         name: metaName,
         content: metaTagContent
-      };
+      } : metaTagContent;
     });
     // Turn [{ name:"viewport" content:"width=500, initial-scale=1" }] into
     // the html-webpack-plugin tag structure
@@ -491,31 +529,39 @@ class HtmlWebpackPlugin {
       return {
         tagName: 'meta',
         voidTag: true,
-        selfClosingTag: selfClosingTag,
         attributes: metaTagAttributes
       };
     });
   }
 
   /**
-   * Injects the assets into the given html string
+   * Turns the given asset information into tag object representations
+   * which is seperated into head and body
+   *
+   * @param {{
+      js: {entryName: string, path: string}[],
+      css: {entryName: string, path: string}[],
+      favicon?: string
+    }} assets
+   *
+   * @returns {{
+       head: HtmlTagObject[],
+       body: HtmlTagObject[]
+     }}
    */
-  generateHtmlTags (assets) {
+  generateHtmlTagObjects (assets) {
     // Turn script files into script tags
     const scripts = assets.js.map(scriptPath => ({
       tagName: 'script',
-      closeTag: true,
+      voidTag: false,
       attributes: {
         type: 'text/javascript',
         src: scriptPath
       }
     }));
-    // Make tags self-closing in case of xhtml
-    const selfClosingTag = !!this.options.xhtml;
     // Turn css files into link tags
     const styles = assets.css.map(stylePath => ({
       tagName: 'link',
-      selfClosingTag: selfClosingTag,
       voidTag: true,
       attributes: {
         href: stylePath,
@@ -530,7 +576,6 @@ class HtmlWebpackPlugin {
     if (assets.favicon) {
       head.push({
         tagName: 'link',
-        selfClosingTag: selfClosingTag,
         voidTag: true,
         attributes: {
           rel: 'shortcut icon',
@@ -551,6 +596,17 @@ class HtmlWebpackPlugin {
 
   /**
    * Injects the assets into the given html string
+   *
+   * @param {string} html
+   * @param {any} assets
+   * The input html
+   * @param {{
+       head: HtmlTagObject[],
+       body: HtmlTagObject[]
+     }} assetTags
+   * The asset tags to inject
+   *
+   * @returns {string}
    */
   injectAssetsIntoHtml (html, assets, assetTags) {
     const htmlRegExp = /(<html[^>]*>)/i;
@@ -597,7 +653,10 @@ class HtmlWebpackPlugin {
   }
 
   /**
-   * Appends a cache busting hash
+   * Appends a cache busting hash to the query string of the url
+   * E.g. http://localhost:8080/ -> http://localhost:8080/?50c9096ba6183fd728eeb065a26ec175
+   * @param {string} url
+   * @param {string} hash
    */
   appendHash (url, hash) {
     if (!url) {
@@ -607,27 +666,11 @@ class HtmlWebpackPlugin {
   }
 
   /**
-   * Turn a tag definition into a html string
-   */
-  createHtmlTag (tagDefinition) {
-    const attributes = Object.keys(tagDefinition.attributes || {})
-      .filter(attributeName => tagDefinition.attributes[attributeName] !== false)
-      .map(attributeName => {
-        if (tagDefinition.attributes[attributeName] === true) {
-          return attributeName;
-        }
-        return attributeName + '="' + tagDefinition.attributes[attributeName] + '"';
-      });
-    // Backport of 3.x void tag definition
-    const voidTag = tagDefinition.voidTag !== undefined ? tagDefinition.voidTag : !tagDefinition.closeTag;
-    const selfClosingTag = tagDefinition.voidTag !== undefined ? tagDefinition.voidTag && this.options.xhtml : tagDefinition.selfClosingTag;
-    return '<' + [tagDefinition.tagName].concat(attributes).join(' ') + (selfClosingTag ? '/' : '') + '>' +
-      (tagDefinition.innerHTML || '') +
-      (voidTag ? '' : '</' + tagDefinition.tagName + '>');
-  }
-
-  /**
    * Helper to return the absolute template path with a fallback loader
+   * @param {string} template
+   * The path to the tempalate e.g. './index.html'
+   * @param {string} context
+   * The webpack base resolution path for relative paths e.g. process.cwd()
    */
   getFullTemplatePath (template, context) {
     // If the template doesn't use a loader use the lodash template loader
@@ -653,6 +696,9 @@ class HtmlWebpackPlugin {
   /**
    * Helper to promisify compilation.applyPluginsAsyncWaterfall that returns
    * a function that helps to merge given plugin arguments with processed ones
+   *
+   * @param {WebpackCompilation} compilation
+   *
    */
   applyPluginsAsyncWaterfall (compilation) {
     return (eventName, requiresResult, pluginArgs) => {
